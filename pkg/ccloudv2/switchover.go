@@ -7,8 +7,10 @@ import (
 
 	switchoverv1 "github.com/confluentinc/ccloud-sdk-go-v2/switchover/v1"
 
+	"github.com/confluentinc/cli/v4/pkg/auth"
 	"github.com/confluentinc/cli/v4/pkg/config"
 	"github.com/confluentinc/cli/v4/pkg/errors"
+	"github.com/confluentinc/cli/v4/pkg/log"
 )
 
 func newSwitchoverClient(httpClient *http.Client, url, userAgent string, unsafeTrace bool) *switchoverv1.APIClient {
@@ -25,11 +27,20 @@ func newSwitchoverClient(httpClient *http.Client, url, userAgent string, unsafeT
 // in preference order:
 //  1. an explicit CONFLUENT_CLOUD_API_KEY / CONFLUENT_CLOUD_API_SECRET env pair,
 //  2. a Cloud API key stored in the logged-in context (api-key cloud login),
-//  3. the logged-in session's bearer token.
+//  3. a regional customer access token exchanged from the logged-in session's
+//     bearer token (POST /api/access_tokens).
 //
 // (1) and (2) are sent as HTTP Basic auth. Basic auth (Cloud API key) is a
-// first-class, supported path: the Switchover Early Access gate applies only to
-// the bearer/login path, not Cloud API keys.
+// first-class, supported path — and per the GA decision (ORC-10314) it is also
+// the documented fallback when the token-exchange control plane is unavailable
+// during a regional incident.
+//
+// (3) is required because the switchover routes are served by
+// frontdoor-api-gateway, which accepts CREDENTIAL_TYPE_API_KEY and
+// CREDENTIAL_TYPE_REGIONAL_CUSTOMER_ACCESS_TOKEN but NOT raw login-session
+// JWTs — sending the session token directly yields 401 Unauthorized. Note the
+// regional token, not the data-plane token from the same exchange: frontdoor
+// validates only the former.
 func (c *Client) switchoverApiContext() context.Context {
 	if key, secret := os.Getenv("CONFLUENT_CLOUD_API_KEY"), os.Getenv("CONFLUENT_CLOUD_API_SECRET"); key != "" && secret != "" {
 		return context.WithValue(context.Background(), switchoverv1.ContextBasicAuth, switchoverv1.BasicAuth{UserName: key, Password: secret})
@@ -39,6 +50,11 @@ func (c *Client) switchoverApiContext() context.Context {
 		if err := pair.DecryptSecret(); err == nil {
 			return context.WithValue(context.Background(), switchoverv1.ContextBasicAuth, switchoverv1.BasicAuth{UserName: pair.Key, Password: pair.Secret})
 		}
+	}
+	if token, err := auth.GetRegionalToken(c.cfg.Context()); err == nil {
+		return context.WithValue(context.Background(), switchoverv1.ContextAccessToken, token)
+	} else {
+		log.CliLogger.Debugf("switchover: regional token exchange failed, falling back to session token: %v", err)
 	}
 	return context.WithValue(context.Background(), switchoverv1.ContextAccessToken, c.cfg.Context().GetAuthToken())
 }
